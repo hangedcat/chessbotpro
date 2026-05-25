@@ -1,0 +1,28 @@
+# Large runtime dependencies (user-provided)
+engine/
+Books/
+chess_piece_model.pth
+
+# Training data
+dataset/
+
+# PyInstaller output
+dist/
+build/
+
+# User config (contains local paths)
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

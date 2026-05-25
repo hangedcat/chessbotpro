@@ -1,0 +1,9 @@
+keyboard
+chess
+mss
+opencv-python
+numpy
+torch
+torchvision
+Pillow
+pyinstaller
