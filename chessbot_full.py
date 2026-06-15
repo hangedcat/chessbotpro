@@ -16,6 +16,80 @@ import random
 # Classes structure
 CLASSES = ['empty', 'wp', 'wn', 'wb', 'wr', 'wq', 'wk', 'bp', 'bn', 'bb', 'br', 'bq', 'bk']
 
+class BboxPreviewOverlay:
+    """Transparent always-on-top window that draws the board bounding box for visual alignment."""
+    def __init__(self, parent, x, y, size, sq_size):
+        self.win = tk.Toplevel(parent)
+        self.win.title("BboxPreview")
+        self.win.overrideredirect(True)
+        self.win.attributes("-transparentcolor", "black")
+        self.win.attributes("-topmost", True)
+        self.win.config(bg="black")
+        self._place(x, y, size)
+
+        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        # Make click-through
+        self.win.after(100, self._apply_click_through)
+        self._draw(size, sq_size)
+
+    def _apply_click_through(self):
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, "BboxPreview")
+            if not hwnd:
+                hwnd = self.win.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_LAYERED     = 0x00080000
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT | WS_EX_LAYERED)
+        except Exception:
+            pass
+
+    def _place(self, x, y, size):
+        # Add a small margin so the border itself is visible even at the screen edge
+        margin = 4
+        self.win.geometry(f"{size + margin*2}x{size + margin*2}+{x - margin}+{y - margin}")
+        self._margin = margin
+
+    def _draw(self, size, sq_size):
+        self.canvas.delete("all")
+        m = self._margin
+        # Outer border in bright blue
+        self.canvas.create_rectangle(m, m, m + size, m + size,
+                                     outline="#3399ff", width=3)
+        # Grid lines for each square in semi-transparent blue
+        for i in range(1, 8):
+            self.canvas.create_line(m + i * sq_size, m,
+                                    m + i * sq_size, m + size,
+                                    fill="#3399ff", width=1, dash=(4, 4))
+            self.canvas.create_line(m,              m + i * sq_size,
+                                    m + size,       m + i * sq_size,
+                                    fill="#3399ff", width=1, dash=(4, 4))
+        # Corner tick marks in yellow for easier alignment
+        tick = 12
+        for cx, cy in [(m, m), (m + size, m), (m, m + size), (m + size, m + size)]:
+            dx = tick if cx == m else -tick
+            dy = tick if cy == m else -tick
+            self.canvas.create_line(cx, cy, cx + dx, cy, fill="#ffff00", width=3)
+            self.canvas.create_line(cx, cy, cx, cy + dy, fill="#ffff00", width=3)
+
+    def update(self, x, y, size, sq_size):
+        self._place(x, y, size)
+        self.canvas.config(width=size + self._margin * 2,
+                           height=size + self._margin * 2)
+        self._draw(size, sq_size)
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class MoveOverlay:
     def __init__(self, parent, x, y, size, sq_size):
         self.parent = parent
@@ -126,12 +200,20 @@ class MoveOverlay:
             cy2 = int((e_row + 0.5) * self.sq_size)
             self.canvas.create_line(cx1, cy1, cx2, cy2, fill=move_color, width=2, dash=(6, 4))
             
-            # Draw classification label on the target square, stacked vertically if multiple moves target the same square
+            # Draw labels on the target square upper-left, stacked vertically if multiple
+            # moves target the same square: +/- score on top, classification below.
             tx = e_col * self.sq_size + 6
-            ty = e_row * self.sq_size + 6 + (rank * 12)
+            ty = e_row * self.sq_size + 6 + (rank * 24)
+
+            score_text = item.get("score", "")
+            if score_text:
+                self.canvas.create_text(tx + 1, ty + 1, text=score_text, fill="black", font=("Arial", 8, "bold"), anchor=tk.NW)
+                self.canvas.create_text(tx, ty, text=score_text, fill=move_color, font=("Arial", 8, "bold"), anchor=tk.NW)
+                ty += 11
+
             self.canvas.create_text(tx + 1, ty + 1, text=move_type, fill="black", font=("Arial", 8, "bold"), anchor=tk.NW)
             self.canvas.create_text(tx, ty, text=move_type, fill=move_color, font=("Arial", 8, "bold"), anchor=tk.NW)
-        
+
     def clear(self):
         self.canvas.delete("all")
         
@@ -160,9 +242,11 @@ class ChessBotPro:
         # State
         self.engine_path = "Stockfish.exe"
         self.engine = None
+        self.maia_engine = None  # Optional lc0/Maia engine for human-like move choice
         self.is_running = False
         self.board_bbox = None  # (x, y, width, height)
         self.sq_size = 0
+        self.bbox_preview = None  # BboxPreviewOverlay instance when active
         self.board_x_var = tk.IntVar(value=0)
         self.board_y_var = tk.IntVar(value=0)
         self.board_size_var = tk.IntVar(value=0)
@@ -200,6 +284,12 @@ class ChessBotPro:
         self.max_mistake_var = tk.IntVar(value=1)
         self.max_blunder_var = tk.IntVar(value=1)
 
+        # Human Engine (Maia / lc0): when enabled, Maia picks the move to recommend/play
+        # while Stockfish still provides the evaluation scores and classifications.
+        self.maia_enabled_var = tk.BooleanVar(value=False)
+        self.maia_path_var = tk.StringVar(value="lc0.exe")
+        self.maia_weights_var = tk.StringVar(value="")
+
         self.create_widgets()
 
         # Trace settings for auto-saving and UI updates
@@ -217,6 +307,9 @@ class ChessBotPro:
                    self.max_excellent_var, self.max_good_var, self.max_inaccuracy_var,
                    self.max_mistake_var, self.max_blunder_var):
             _v.trace_add("write", self.save_config)
+        self.maia_enabled_var.trace_add("write", self.save_config)
+        self.maia_path_var.trace_add("write", self.save_config)
+        self.maia_weights_var.trace_add("write", self.save_config)
 
         self.load_config()
         self._update_strength_ui()
@@ -231,9 +324,32 @@ class ChessBotPro:
         
         settings_frame = ttk.Frame(notebook)
         notebook.add(settings_frame, text="Settings")
+
+        # Wrap settings content in a scrollable canvas so nothing gets clipped
+        _settings_canvas = tk.Canvas(settings_frame, highlightthickness=0)
+        _settings_scroll = ttk.Scrollbar(settings_frame, orient=tk.VERTICAL, command=_settings_canvas.yview)
+        _settings_canvas.configure(yscrollcommand=_settings_scroll.set)
+        _settings_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        _settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _settings_inner = ttk.Frame(_settings_canvas)
+        _settings_window = _settings_canvas.create_window((0, 0), window=_settings_inner, anchor="nw")
+
+        def _on_settings_configure(event):
+            _settings_canvas.configure(scrollregion=_settings_canvas.bbox("all"))
+        def _on_canvas_resize(event):
+            _settings_canvas.itemconfig(_settings_window, width=event.width)
+
+        _settings_inner.bind("<Configure>", _on_settings_configure)
+        _settings_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Allow mouse-wheel scrolling when the cursor is over the settings tab
+        def _on_mousewheel(event):
+            _settings_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        _settings_canvas.bind("<Enter>", lambda e: _settings_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        _settings_canvas.bind("<Leave>", lambda e: _settings_canvas.unbind_all("<MouseWheel>"))
         
         self._build_main_tab(main_frame)
-        self._build_settings_tab(settings_frame)
+        self._build_settings_tab(_settings_inner)
         
         self.status_var = tk.StringVar(value="Status: Ready")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
@@ -253,9 +369,13 @@ class ChessBotPro:
         control_frame = ttk.LabelFrame(frame, text="Controls")
         control_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.btn_detect = ttk.Button(control_frame, text="1. Auto-Detect Chess Board", 
+        self.btn_detect = ttk.Button(control_frame, text="1. Auto-Detect Chess Board",
                                       command=lambda: threading.Thread(target=self.auto_detect_board_action, daemon=True).start())
         self.btn_detect.pack(fill=tk.X, padx=5, pady=2)
+
+        self.btn_debug_screenshot = ttk.Button(control_frame, text="   Debug: Save Detection Screenshot",
+                                               command=lambda: threading.Thread(target=self.save_debug_screenshot, daemon=True).start())
+        self.btn_debug_screenshot.pack(fill=tk.X, padx=5, pady=2)
         
         self.chk_flipped = ttk.Checkbutton(control_frame, text="Flipped Board (Black at bottom)", variable=self.flipped_var)
         self.chk_flipped.pack(fill=tk.X, padx=5, pady=2)
@@ -349,6 +469,32 @@ class ChessBotPro:
             ttk.Spinbox(limits_frame, from_=0, to=10, textvariable=var_r, width=5).grid(
                 row=row_i, column=3, padx=5, pady=3, sticky=tk.W)
 
+        # Human Engine (Maia / lc0) Frame
+        maia_frame = ttk.LabelFrame(frame, text="Human Engine (Maia / lc0)")
+        maia_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.chk_maia = ttk.Checkbutton(maia_frame, text="Use Maia to choose the move (human-like)",
+                                        variable=self.maia_enabled_var)
+        self.chk_maia.pack(fill=tk.X, padx=5, pady=(5, 2))
+
+        maia_exe_row = ttk.Frame(maia_frame)
+        maia_exe_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(maia_exe_row, text="lc0.exe:", width=9).pack(side=tk.LEFT)
+        ttk.Entry(maia_exe_row, textvariable=self.maia_path_var, state='readonly').pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(maia_exe_row, text="Browse...", command=self.browse_maia_engine).pack(side=tk.RIGHT)
+
+        maia_w_row = ttk.Frame(maia_frame)
+        maia_w_row.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(maia_w_row, text="Weights:", width=9).pack(side=tk.LEFT)
+        ttk.Entry(maia_w_row, textvariable=self.maia_weights_var, state='readonly').pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(maia_w_row, text="Browse...", command=self.browse_maia_weights).pack(side=tk.RIGHT)
+
+        ttk.Label(maia_frame,
+                  text="Requires lc0.exe + a maia-*.pb.gz weights file. Pick the rating by the weights file.",
+                  foreground="#666666", wraplength=420, justify=tk.LEFT).pack(fill=tk.X, padx=5, pady=(2, 5))
+
         # Book Frame
         book_frame = ttk.LabelFrame(frame, text="Opening Book Configuration")
         book_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -360,15 +506,26 @@ class ChessBotPro:
         # Coordinates Frame
         coords_frame = ttk.LabelFrame(frame, text="Board Bounding Box (Manual Tuning)")
         coords_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(coords_frame, text="Board X (px):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(coords_frame, textvariable=self.board_x_var, width=10).grid(row=0, column=1, padx=5, pady=5)
-        
-        ttk.Label(coords_frame, text="Board Y (px):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(coords_frame, textvariable=self.board_y_var, width=10).grid(row=1, column=1, padx=5, pady=5)
-        
-        ttk.Label(coords_frame, text="Board Size (px):").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(coords_frame, textvariable=self.board_size_var, width=10).grid(row=2, column=1, padx=5, pady=5)
+
+        def make_nudge_row(parent, label, var, row, step=1):
+            ttk.Label(parent, text=label).grid(row=row, column=0, padx=5, pady=3, sticky=tk.W)
+            ttk.Entry(parent, textvariable=var, width=8).grid(row=row, column=1, padx=2, pady=3)
+            ttk.Button(parent, text="−10", width=4,
+                       command=lambda v=var, s=step*10: v.set(v.get() - s)).grid(row=row, column=2, padx=1)
+            ttk.Button(parent, text="−1", width=4,
+                       command=lambda v=var, s=step: v.set(v.get() - s)).grid(row=row, column=3, padx=1)
+            ttk.Button(parent, text="+1", width=4,
+                       command=lambda v=var, s=step: v.set(v.get() + s)).grid(row=row, column=4, padx=1)
+            ttk.Button(parent, text="+10", width=4,
+                       command=lambda v=var, s=step*10: v.set(v.get() + s)).grid(row=row, column=5, padx=1)
+
+        make_nudge_row(coords_frame, "Board X (px):",    self.board_x_var,    row=0)
+        make_nudge_row(coords_frame, "Board Y (px):",    self.board_y_var,    row=1)
+        make_nudge_row(coords_frame, "Board Size (px):", self.board_size_var, row=2)
+
+        self.btn_bbox_preview = ttk.Button(coords_frame, text="👁 Show Box on Screen",
+                                           command=self.toggle_bbox_preview)
+        self.btn_bbox_preview.grid(row=3, column=0, columnspan=6, padx=5, pady=6, sticky=tk.EW)
 
     def log(self, message):
         if threading.current_thread() is threading.main_thread():
@@ -389,7 +546,23 @@ class ChessBotPro:
             self.engine_var.set(path)
             self.log(f"Engine path updated: {path}")
             self.save_config()
-            
+
+    def browse_maia_engine(self):
+        path = filedialog.askopenfilename(title="Select lc0 Executable", filetypes=[("Executables", "*.exe")])
+        if path:
+            self.maia_path_var.set(path)
+            self.log(f"Maia (lc0) path updated: {path}")
+            self.save_config()
+
+    def browse_maia_weights(self):
+        path = filedialog.askopenfilename(
+            title="Select Maia Weights",
+            filetypes=[("Weights", "*.pb.gz;*.pb;*.gz"), ("All files", "*.*")])
+        if path:
+            self.maia_weights_var.set(path)
+            self.log(f"Maia weights updated: {os.path.basename(path)}")
+            self.save_config()
+
     def load_config(self):
         try:
             if os.path.exists(self.config_path):
@@ -453,7 +626,15 @@ class ChessBotPro:
                     self.flipped_var.set(config["flipped"])
                 if "autoplay" in config:
                     self.autoplay_var.set(config["autoplay"])
-                    
+
+                # Load Maia (lc0) settings
+                if "maia_enabled" in config:
+                    self.maia_enabled_var.set(config["maia_enabled"])
+                if "maia_path" in config and config["maia_path"]:
+                    self.maia_path_var.set(config["maia_path"])
+                if "maia_weights" in config and config["maia_weights"]:
+                    self.maia_weights_var.set(config["maia_weights"])
+
                 self.log("Configuration loaded successfully.")
         except Exception as e:
             self.log(f"Error loading configuration: {e}")
@@ -505,7 +686,10 @@ class ChessBotPro:
                 "board_y": safe_get_int(self.board_y_var, 0),
                 "board_size": safe_get_int(self.board_size_var, 0),
                 "flipped": safe_get_bool(self.flipped_var, False),
-                "autoplay": safe_get_bool(self.autoplay_var, False)
+                "autoplay": safe_get_bool(self.autoplay_var, False),
+                "maia_enabled": safe_get_bool(self.maia_enabled_var, False),
+                "maia_path": self.maia_path_var.get(),
+                "maia_weights": self.maia_weights_var.get()
             }
             with open(self.config_path, "w") as f:
                 json.dump(config, f, indent=4)
@@ -520,7 +704,7 @@ class ChessBotPro:
             if w > 0:
                 self.board_bbox = (x, y, w, w)
                 self.sq_size = w // 8
-                
+
                 if self.overlay:
                     self.overlay.x = x
                     self.overlay.y = y
@@ -528,9 +712,29 @@ class ChessBotPro:
                     self.overlay.sq_size = w // 8
                     self.overlay.win.geometry(f"{w}x{w}+{x}+{y}")
                     self.overlay.canvas.config(width=w, height=w)
+
+                if self.bbox_preview:
+                    self.bbox_preview.update(x, y, w, w // 8)
+
                 self.save_config()
         except Exception:
             pass
+
+    def toggle_bbox_preview(self):
+        if self.bbox_preview:
+            # Hide: destroy the overlay and reset button label
+            self.bbox_preview.destroy()
+            self.bbox_preview = None
+            self.btn_bbox_preview.config(text="👁 Show Box on Screen")
+        else:
+            # Show: require a valid bbox first
+            if not self.board_bbox or self.board_bbox[2] == 0:
+                messagebox.showwarning("No bbox", "Run Auto-Detect first (or set Board X/Y/Size manually).")
+                return
+            x, y, w, _ = self.board_bbox
+            sq = w // 8
+            self.bbox_preview = BboxPreviewOverlay(self.root, x, y, w, sq)
+            self.btn_bbox_preview.config(text="👁 Hide Box on Screen")
 
     def browse_book(self):
         path = filedialog.askopenfilename(
@@ -648,6 +852,91 @@ class ChessBotPro:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load engine:\n{e}")
             return False
+
+    def init_maia_engine(self):
+        """Launch the lc0/Maia engine used to pick human-like moves. Returns True on success.
+
+        Never raises: on any failure it logs a warning and returns False so the bot can
+        fall back to Stockfish-only move selection.
+        """
+        if self.maia_engine:
+            try:
+                self.maia_engine.ping()
+                return True
+            except Exception:
+                self.log("Maia process died, re-initializing...")
+                self.maia_engine = None
+
+        lc0_path = self.maia_path_var.get()
+        weights_path = self.maia_weights_var.get()
+        if not lc0_path or not os.path.exists(lc0_path):
+            self.log(f"Warning: lc0 executable not found at '{lc0_path}'. Maia disabled for this run.")
+            return False
+        if not weights_path or not os.path.exists(weights_path):
+            self.log(f"Warning: Maia weights not found at '{weights_path}'. Maia disabled for this run.")
+            return False
+
+        try:
+            self.log(f"Initializing Maia (lc0) with {os.path.basename(weights_path)}...")
+            self.maia_engine = chess.engine.SimpleEngine.popen_uci(
+                [lc0_path, f"--weights={weights_path}"])
+            # Init uses the default 10s timeout (loading the NN can be slow). Per-move
+            # queries are tiny, so tighten the timeout afterwards to fail fast instead
+            # of letting an unresponsive engine stall the think loop.
+            self.maia_engine.timeout = 5.0
+            self.maia_fail_count = 0
+            self.log("Maia engine loaded successfully.")
+            return True
+        except Exception as e:
+            self.log(f"Warning: Failed to load Maia engine: {e}. Continuing with Stockfish only.")
+            self.maia_engine = None
+            return False
+
+    def get_maia_move(self, board):
+        """Return Maia's most-likely human move (lc0 policy at nodes=1), or None.
+
+        The limit carries an explicit ``time`` ceiling: python-chess only applies a
+        wall-clock timeout when ``Limit.time`` is set, so a bare ``nodes=1`` limit would
+        let an unresponsive lc0 hang the worker thread forever (leaving ``is_thinking``
+        stuck True and freezing the overlay). After repeated failures Maia is disabled
+        for the session so the bot keeps running on Stockfish.
+        """
+        if not self.maia_engine:
+            return None
+        try:
+            result = self.maia_engine.play(board, chess.engine.Limit(nodes=1, time=2.0))
+            self.maia_fail_count = 0
+            return result.move
+        except Exception as e:
+            self.maia_fail_count = getattr(self, "maia_fail_count", 0) + 1
+            self.log(f"Maia move error ({self.maia_fail_count}/3): {e}")
+            if self.maia_fail_count >= 3:
+                self.log("Maia unresponsive - disabling it for this session, using Stockfish only.")
+                try:
+                    self.maia_engine.quit()
+                except Exception:
+                    pass
+                self.maia_engine = None
+            return None
+
+    def _format_eval(self, pov_score):
+        """Format a python-chess PovScore as a short +/- string from the side-to-move's view.
+
+        Positive always means good for the player to move (e.g. '+1.5', '-0.3', '+M3').
+        """
+        try:
+            rel = pov_score.relative
+            if rel.is_mate():
+                m = rel.mate()
+                if m is None:
+                    return ""
+                return f"+M{abs(m)}" if m > 0 else f"-M{abs(m)}"
+            cp = rel.score()
+            if cp is None:
+                return ""
+            return f"{cp / 100.0:+.1f}"
+        except Exception:
+            return ""
 
     def _apply_engine_settings(self):
         """Apply ELO, Skill Level, Threads, and Hash limit options to the running engine."""
@@ -914,15 +1203,59 @@ class ChessBotPro:
         self.log("Scanning screen for chess board...")
         bbox = self.auto_detect_board()
         if bbox:
-            # Setting these variables automatically triggers update_board_from_settings via traces
-            self.board_x_var.set(bbox[0])
-            self.board_y_var.set(bbox[1])
-            self.board_size_var.set(bbox[2])
+            # Schedule all Tkinter widget updates on the main thread
+            def _apply():
+                self.board_x_var.set(bbox[0])
+                self.board_y_var.set(bbox[1])
+                self.board_size_var.set(bbox[2])
+                self.btn_detect.config(text="1. Auto-Detect Chess Board (Done)")
+            self.root.after(0, _apply)
             self.log(f"Board detected! x={bbox[0]}, y={bbox[1]}, size={bbox[2]}px (sq={bbox[4]}px)")
-            self.btn_detect.config(text="1. Auto-Detect Chess Board (Done)")
         else:
             self.log("ERROR: Chess board not found on screen!")
-            messagebox.showerror("Error", "Could not find a chess board on screen. Ensure the board is fully visible.")
+            self.root.after(0, lambda: messagebox.showerror("Error", "Could not find a chess board on screen. Ensure the board is fully visible."))
+
+    def save_debug_screenshot(self):
+        """Take a screenshot, draw the detected board bbox on it, and save to disk for diagnosis."""
+        import os
+        self.log("Saving debug detection screenshot...")
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                screenshot = np.array(sct.grab(monitor))
+            bgr = screenshot[:, :, :3].copy()
+
+            bbox = self.auto_detect_board()
+            if bbox:
+                x, y, w, h, sq = bbox
+                # Draw the detected board rectangle in bright green
+                cv2.rectangle(bgr, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                # Draw individual square grid lines in yellow
+                for i in range(9):
+                    cv2.line(bgr, (x + i * sq, y), (x + i * sq, y + h), (0, 255, 255), 1)
+                    cv2.line(bgr, (x, y + i * sq), (x + w, y + i * sq), (0, 255, 255), 1)
+                label = f"Detected: x={x} y={y} size={w} sq={sq}"
+                cv2.putText(bgr, label, (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                self.log(f"Debug: {label}")
+            else:
+                cv2.putText(bgr, "NO BOARD DETECTED", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+                self.log("Debug: No board detected in screenshot.")
+
+            # Also draw the currently stored bbox in blue for comparison
+            try:
+                sx, sy, sw, sh = self.board_bbox
+                cv2.rectangle(bgr, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 2)
+                cv2.putText(bgr, f"Stored: x={sx} y={sy} size={sw}", (sx, sy + sh + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            except Exception:
+                pass
+
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_detection.png")
+            cv2.imwrite(out_path, bgr)
+            self.log(f"Debug screenshot saved: {out_path}")
+            self.root.after(0, lambda: messagebox.showinfo("Debug Screenshot", f"Saved to:\n{out_path}"))
+        except Exception as e:
+            self.log(f"Debug screenshot error: {e}")
 
     def find_board_in_row(self, row_bgr, width):
         row = row_bgr.astype(np.int16)
@@ -1028,9 +1361,11 @@ class ChessBotPro:
             
         best_y_start = y_rough
         best_grad_sum = -1
-        
+
         # Search for the optimal offset (in squares) and fine-tuning (dy in pixels)
-        for offset in range(8):
+        # Search both above (-8..0) and below (0..+1) y_rough to handle boards where
+        # y_rough lands inside the board rather than at the top edge
+        for offset in range(-1, 9):
             for dy in range(-sq_size // 2, sq_size // 2):
                 y_start_cand = y_rough - offset * sq_size + dy
                 if y_start_cand < 0 or y_start_cand + board_size >= screen_h:
@@ -1225,7 +1560,13 @@ class ChessBotPro:
             return
         if not self.init_engine():
             return
-            
+
+        # Optionally start the Maia (lc0) human engine. Failure is non-fatal: the bot
+        # continues with Stockfish-only move selection.
+        if self.maia_enabled_var.get():
+            if not self.init_maia_engine():
+                self.log("Maia unavailable - using Stockfish for move choice this run.")
+
         # Lazy load book lines if not already loaded
         if not self.book_lines:
             self.load_book()
@@ -1247,6 +1588,7 @@ class ChessBotPro:
             
         self.board_history = []
         self.desync_count = 0
+        self.maia_fail_count = 0
         self.is_thinking = False # Flag to track background Stockfish calculations
         self.is_running = True
         self.last_clicked_fen = ""
@@ -1311,6 +1653,10 @@ class ChessBotPro:
                         # Clear visual overlay on opponent's turn
                         if self.overlay:
                             self.root.after(0, self.overlay.clear)
+                        # Invalidate the cache so the overlay is recomputed & redrawn the
+                        # next time it's our turn, even if the position FEN is unchanged
+                        # (e.g. after a transient mis-detection cleared the overlay).
+                        last_calculated_fen = ""
                             
                 # Think and overlay moves ONLY on player's active turn when the position has changed
                 if self.current_turn == color:
@@ -1328,7 +1674,8 @@ class ChessBotPro:
                                 moves_data.append({
                                     "move": move_str,
                                     "type": "Book",
-                                    "color": "#d5a478"
+                                    "color": "#d5a478",
+                                    "score": ""
                                 })
                             self.root.after(0, lambda md=moves_data, fl=is_flipped: self.overlay.draw_moves(md, fl) if self.overlay else None)
                             
@@ -1363,39 +1710,83 @@ class ChessBotPro:
 
                                             analysis = self.engine.analyse(b, engine_limit, multipv=5)
                                             analysis = sorted(analysis, key=lambda x: x.get("multipv", 1))
-                                            
-                                            # Extract relative scores from perspective of the side to move
-                                            scores = []
+
+                                            # Build one aligned list of candidate moves with their
+                                            # Stockfish scores (relative = from the side-to-move's view).
+                                            entries = []
                                             for entry in analysis:
-                                                if "score" in entry and entry["score"] is not None:
-                                                    scores.append(entry["score"].relative.score(mate_score=10000))
-                                                    
-                                            best_score = scores[0] if scores else 0
-                                            second_best_score = scores[1] if len(scores) > 1 else None
-                                            
-                                            moves_data = []
-                                            log_msgs = []
-                                            
-                                            for idx, entry in enumerate(analysis):
-                                                if "pv" in entry and len(entry["pv"]) > 0:
-                                                    move = entry["pv"][0]
-                                                    move_str = move.uci()
-                                                    
-                                                    # Get score for this move
-                                                    score_val = scores[idx] if idx < len(scores) else best_score
-                                                    
-                                                    # Classify move using centipawn difference
-                                                    m_type, m_color = self.classify_move(
-                                                        b, move, score_val, best_score, second_best_score, []
-                                                    )
-                                                    
-                                                    moves_data.append({
-                                                        "move": move_str,
-                                                        "type": m_type,
-                                                        "color": m_color
-                                                    })
-                                                    log_msgs.append(f"{m_type}: {move_str}")
-                                                    
+                                                pv = entry.get("pv")
+                                                score_obj = entry.get("score")
+                                                if not pv or score_obj is None:
+                                                    continue
+                                                entries.append({
+                                                    "move": pv[0],
+                                                    "score_obj": score_obj,
+                                                    "cp": score_obj.relative.score(mate_score=10000),
+                                                })
+
+                                            if not entries:
+                                                self.log("Engine returned no candidate moves.")
+                                                return
+
+                                            best_score = entries[0]["cp"]
+                                            second_best_score = entries[1]["cp"] if len(entries) > 1 else None
+
+                                            def build_item(e):
+                                                m_type, m_color = self.classify_move(
+                                                    b, e["move"], e["cp"], best_score, second_best_score, [])
+                                                return {
+                                                    "move": e["move"].uci(),
+                                                    "type": m_type,
+                                                    "color": m_color,
+                                                    "score": self._format_eval(e["score_obj"]),
+                                                }
+
+                                            moves_data = [build_item(e) for e in entries]
+
+                                            # Maia hybrid: let the human engine pick which move is
+                                            # primary (highlighted + auto-played). Stockfish still
+                                            # supplies every eval score and classification.
+                                            if self.maia_enabled_var.get() and self.maia_engine:
+                                                maia_move = self.get_maia_move(b)
+                                                if maia_move is not None:
+                                                    maia_uci = maia_move.uci()
+                                                    idx = next((i for i, m in enumerate(moves_data)
+                                                                if m["move"] == maia_uci), None)
+                                                    if idx is not None:
+                                                        # Already among Stockfish's top lines: promote it.
+                                                        moves_data.insert(0, moves_data.pop(idx))
+                                                    else:
+                                                        # Outside the top lines (a human-only choice):
+                                                        # score it with Stockfish, then make it primary.
+                                                        try:
+                                                            # Quick, time-bounded eval of just this
+                                                            # one move (for its score label). The time
+                                                            # ceiling guarantees python-chess applies a
+                                                            # timeout so it can never hang the loop.
+                                                            info = self.engine.analyse(
+                                                                b, chess.engine.Limit(depth=12, time=3.0),
+                                                                root_moves=[maia_move])
+                                                            if isinstance(info, list):
+                                                                info = info[0]
+                                                            m_score_obj = info.get("score")
+                                                            m_cp = (m_score_obj.relative.score(mate_score=10000)
+                                                                    if m_score_obj else best_score)
+                                                            m_type, m_color = self.classify_move(
+                                                                b, maia_move, m_cp, best_score,
+                                                                second_best_score, [])
+                                                            moves_data.insert(0, {
+                                                                "move": maia_uci,
+                                                                "type": m_type,
+                                                                "color": m_color,
+                                                                "score": self._format_eval(m_score_obj) if m_score_obj else "",
+                                                            })
+                                                        except Exception as me:
+                                                            self.log(f"Maia move eval error: {me}")
+                                                    self.log(f"Maia (human) move: {maia_uci}")
+
+                                            log_msgs = [f"{m['type']}: {m['move']} ({m['score']})"
+                                                        for m in moves_data]
                                             if log_msgs:
                                                 self.log(" | ".join(log_msgs))
 
@@ -1578,6 +1969,12 @@ class ChessBotPro:
             self.overlay = None
         if self.engine:
             self.engine.quit()
+        if self.maia_engine:
+            try:
+                self.maia_engine.quit()
+            except Exception:
+                pass
+            self.maia_engine = None
         self.root.destroy()
 
 if __name__ == "__main__":
